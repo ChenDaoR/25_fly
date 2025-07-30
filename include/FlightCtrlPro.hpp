@@ -29,6 +29,80 @@
 #include <bitset>
 #include <dynamic_reconfigure/server.h>
 #include <flight_ctrl/PidGainsConfig.h>
+#include <boost/crc.hpp>
+
+struct GridWaypoint
+{
+    Eigen::Vector2i grid_coord;   // 网格坐标 (row, col)
+    double height;                 // 飞行高度 (固定1.2m)
+    int action;                    // 执行动作 (0:仅飞行, 1:巡查, 2:降落)
+    
+    GridWaypoint() = default;
+    GridWaypoint(int r, int c, double h, int a) 
+        : grid_coord(r, c), height(h), action(a) {}
+    
+    // 转换为字符串表示
+    std::string toString() const
+    {
+        std::stringstream ss;
+        ss << "Grid: (" << grid_coord[0] << "," << grid_coord[1] 
+           << "), Height: " << height << "m, Action: ";
+
+        switch(action)
+        {
+            case 0: ss << "Fly"; break;
+            case 1: ss << "Survey"; break;
+            case 2: ss << "Land"; break;
+        }
+        return ss.str();
+    }
+};
+
+// 预规划路径结构体
+struct PrecomputedPath
+{
+    uint32_t id;                         // 路径ID (位图hash)
+    std::string bitmap_str;              // 位图字符串 (base36压缩)
+    std::vector<GridWaypoint> waypoints; // 网格航点序列
+    
+    // 转换为JSON格式
+    nlohmann::json toJson() const
+    {
+        nlohmann::json j;
+        j["id"] = id;
+        j["bitmap"] = bitmap_str;
+        
+        nlohmann::json points;
+        for (const auto& wp : waypoints) {
+            nlohmann::json point;
+            point["row"] = wp.grid_coord[0];
+            point["col"] = wp.grid_coord[1];
+            point["height"] = wp.height;
+            point["action"] = wp.action;
+            points.push_back(point);
+        }
+        j["waypoints"] = points;
+        return j;
+    }
+    
+    // 从JSON加载
+    static PrecomputedPath fromJson(const nlohmann::json& j)
+    {
+        PrecomputedPath path;
+        path.id = j["id"];
+        path.bitmap_str = j["bitmap"];
+        
+        for (const auto& point : j["waypoints"]) {
+            GridWaypoint wp;
+            wp.grid_coord = {point["row"], point["col"]};
+            wp.height = point["height"];
+            wp.action = point["action"];
+            path.waypoints.push_back(wp);
+        }
+        return path;
+    }
+};
+
 
 class GridMap {
 private:
@@ -57,20 +131,38 @@ public:
     std::pair<int, int> ab2Grid(const std::string& ab);
     // === 可视化输出 ===
     void printMap() const;
+    const std::bitset<63> getBitMap() const { return bitMap_; }
 };
 
 /*MissionManager类设计 主要关注任务的切换，扩展*/
 class MissionManager 
 {
 private:
+
+    // 成员变量
+    GridMap grid_map_; // 包含当前位图状态
+    std::vector<GridWaypoint> current_path_;
+    size_t current_waypoint_index_ = 0;
+    ros::Time waypoint_start_time_; // 当前航点开始时间
+    double max_waypoint_time_ = 5.0; // 最大飞行时间 (秒)
+    // 存储路径的文件名
+    std::string path_directory_;
+    std::string PATH_FILE;
+
     std::vector<Eigen::Vector4d> waypoints_;
     int current_index;
     int current_mission_id;
-
     GridMap gridMap_;
 
+    std::string calculateBitmapHash() const; // 计算当前位图的唯一hash
+    PrecomputedPath findPathByBitmap(const std::string& bitmap_hash) const;
+    bool savePathsToFile(const std::vector<PrecomputedPath>& paths);
+    std::vector<PrecomputedPath> loadPathsFromFile() const;
+    std::string getPathFilename(const std::string& bitmap_hash) const;
+
 public:
-    MissionManager(); 
+    //MissionManager(); 
+    explicit MissionManager(const std::string& path_directory = "~/mission_paths");
     ~MissionManager();
     bool loadMission(const int& misssion_id);   
     const Eigen::Vector4d& getCurrentWaypoint();
@@ -79,6 +171,14 @@ public:
     bool isFinished();
     void reset();
 
+     // 重构loadMission：从位图加载预规划路径
+    bool loadMission(const std::string& mission_name, const std::string& bitmap_hash);
+    // 获取当前路径
+    const std::vector<GridWaypoint>& getCurrentPath() const { return current_path_; }
+    // 检查是否已加载路径
+    bool isPathLoaded() const { return !current_path_.empty(); }
+    // 超时处理：切换到下一个航点
+    void handleTimeout();
     // 初始化时设置禁飞区
     void initNoFlyZones(const std::vector<std::string>& zones);
     // 巡查过程中更新网格状态
@@ -88,6 +188,8 @@ public:
     std::bitset<63> getNoFlyBitmap() const;
     // 获取矩阵状态用于算法
     std::vector<std::vector<int>> getGridMatrix() const;
+    // 新增路径保存接口
+    bool savePathToFile(const PrecomputedPath& path);
 
 };
 

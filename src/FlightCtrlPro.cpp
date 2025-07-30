@@ -292,7 +292,7 @@ void MapMotion::dy_pid_Callback(flight_ctrl::PidGainsConfig &config,uint32_t lev
                             config.yaw_d_filter_value);
 }
 
-MissionManager::MissionManager(){}
+MissionManager::MissionManager(const std::string& path_directory){}
 
 MissionManager::~MissionManager(){}
 
@@ -398,6 +398,153 @@ std::bitset<63> MissionManager::getNoFlyBitmap() const {
 // 获取矩阵状态用于算法
 std::vector<std::vector<int>> MissionManager::getGridMatrix() const {
     return gridMap_.getStateMatrix();
+}
+
+// 计算位图的唯一哈希值
+std::string MissionManager::calculateBitmapHash() const
+{
+    const auto& bitmap = grid_map_.getBitMap();   // std::bitset<63>
+
+    boost::crc_32_type crc32;
+
+    /* 方法：把 bitset<63> 转成 uint64_t 后一次性 CRC */
+    uint64_t val = bitmap.to_ullong();
+    crc32.process_bytes(&val, sizeof(val));
+
+    /* 转成 base36 字符串 */
+    const std::string base36 = "0123456789abcdefghijklmnopqrstuvwxyz";
+    uint32_t hash_value = crc32.checksum();
+    std::string hash_str;
+
+    do {
+        hash_str = base36[hash_value % 36] + hash_str;
+        hash_value /= 36;
+    } while (hash_value);
+
+    /* 补零到 8 位 */
+    hash_str.insert(0, 8 - hash_str.size(), '0');
+
+    return hash_str;
+}
+
+// 加载任务 - 核心重构
+bool MissionManager::loadMission(const std::string& mission_name, 
+                               const std::string& bitmap_hash) 
+{
+    // 获取预规划路径
+    auto path = findPathByBitmap(bitmap_hash);
+    
+    if (path.waypoints.empty()) {
+        ROS_ERROR("No precomputed path found for hash: %s", bitmap_hash.c_str());
+        return false;
+    }
+    
+    // 设置当前路径
+    current_path_ = path.waypoints;
+    current_waypoint_index_ = 0;
+    waypoint_start_time_ = ros::Time::now();
+    
+    ROS_INFO("Loaded mission: %s with %zu waypoints",
+         mission_name.c_str(), current_path_.size());
+    
+    return true;
+}
+
+// 从文件查找匹配的路径
+PrecomputedPath MissionManager::findPathByBitmap(const std::string& bitmap_hash) const 
+{
+    auto all_paths = loadPathsFromFile();
+    
+    for (const auto& path : all_paths) 
+    {
+        if (path.bitmap_str == bitmap_hash)
+        {
+            ROS_DEBUG("Found matching path ID: %u", path.id);
+            return path;
+        }
+    }
+    
+    ROS_WARN("No matching path for hash %s, loading default...", bitmap_hash.c_str());
+    // 生成默认路径 (直线巡查)
+    PrecomputedPath default_path;
+    default_path.bitmap_str = bitmap_hash;
+    
+    // 添加降落点
+    //default_path.waypoints.emplace_back(0, 0, 0.5, 2); // 降落动作
+    return default_path;
+}
+
+// 保存路径到文件
+bool MissionManager::savePathsToFile(const std::vector<PrecomputedPath>& paths) 
+{
+    nlohmann::json j_array;
+    
+    for (const auto& path : paths) 
+    {
+        j_array.push_back(path.toJson());
+    }
+    
+    std::ofstream out_file(PATH_FILE);
+    if (!out_file) 
+    {
+        ROS_ERROR("Failed to open path file: %s", PATH_FILE.c_str());
+        return false;
+    }
+    
+    out_file << j_array.dump(4); // 缩进4格增强可读性
+    return true;
+}
+
+// 从文件加载路径
+std::vector<PrecomputedPath> MissionManager::loadPathsFromFile() const {
+    std::vector<PrecomputedPath> paths;
+    
+    std::ifstream in_file(PATH_FILE);
+    if (!in_file) {
+        ROS_WARN("Precomputed path file not found: %s", PATH_FILE.c_str());
+        return paths;
+    }
+    
+    try {
+        nlohmann::json j;
+        in_file >> j;
+        
+        for (const auto& item : j) {
+            paths.push_back(PrecomputedPath::fromJson(item));
+        }
+    } catch (const std::exception& e) {
+        ROS_ERROR("Error parsing path file: %s", e.what());
+    }
+    
+    ROS_INFO("Loaded %zu precomputed paths", paths.size());
+    return paths;
+}
+
+// 超时处理：切换到下一个航点
+void MissionManager::handleTimeout() {
+    if (current_path_.empty()) return;
+    
+    // 检查是否超时
+    double elapsed = (ros::Time::now() - waypoint_start_time_).toSec();
+    if (elapsed >= max_waypoint_time_) {
+        ROS_WARN("Waypoint %zu timeout (%.1f sec), moving to next point", 
+                 current_waypoint_index_, elapsed);
+        
+        // 移动到下一个航点
+        if (++current_waypoint_index_ >= current_path_.size()) {
+            ROS_INFO("All waypoints completed");
+            current_path_.clear();
+        } else {
+            // 重置航点计时器
+            waypoint_start_time_ = ros::Time::now();
+        }
+    }
+}
+
+// 计算文件名
+std::string MissionManager::getPathFilename(const std::string& bitmap_hash) const
+{
+    return path_directory_ + "/" + bitmap_hash + ".json";
 }
 
 
@@ -934,6 +1081,10 @@ void GridMap::setGridState(int i, int j, int state)
     {
         stateMatrix_[i][j] = state;
     }
+
+    // 状态变更时同步位图
+    if (state == 1) setBitPosition(i, j, true);
+    else setBitPosition(i, j, false);
 }
 
 std::pair<int, int> GridMap::ab2Grid(const std::string& ab)
