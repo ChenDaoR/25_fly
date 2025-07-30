@@ -372,6 +372,34 @@ void MissionManager::reset()
 {
     current_index = 0;
 }
+void MissionManager::initNoFlyZones(const std::vector<std::string>& zones)
+{
+        gridMap_.setNoFlyFromAB(zones);
+        // 调试输出
+        ROS_INFO("[GridMap] No-fly zones set:");
+        gridMap_.printMap();
+}
+    
+// 巡查过程中更新网格状态
+void MissionManager::markGridCovered(int i, int j)
+{
+    gridMap_.setGridState(i, j, 2); // 标记为已巡查
+}
+    
+void MissionManager::markAnimalFound(int i, int j) {
+    gridMap_.setGridState(i, j, 3); // 标记为有动物
+}
+    
+// 获取位图用于路径规划
+std::bitset<63> MissionManager::getNoFlyBitmap() const {
+    return gridMap_.getFullBitMap();
+}
+    
+// 获取矩阵状态用于算法
+std::vector<std::vector<int>> MissionManager::getGridMatrix() const {
+    return gridMap_.getStateMatrix();
+}
+
 
 FlightCore::FlightCore(const ros::NodeHandle& nh_,const ros::NodeHandle& nh_private)
     :nh(nh_),nh_private(nh_private),rate(150),initial_flag(false)
@@ -410,6 +438,21 @@ FlightCore::FlightCore(const ros::NodeHandle& nh_,const ros::NodeHandle& nh_priv
 
     move.setTimeout(TIMEOUT);
     move.setErr(POS_ERR,YAW_ERR);
+
+    // 接收外部输入的禁飞区代码
+    std::vector<std::string> noFlyZones = {"A8B2", "A7B3", "A6B3"};
+    
+    // 初始化地图并转换为位图
+    mission.initNoFlyZones(noFlyZones);
+    
+    // 获取位图用于路径规划
+    auto noFlyBitmap = mission.getNoFlyBitmap();
+    ROS_INFO("No-fly bitmap: %s", noFlyBitmap.to_string().c_str());
+    
+    // 获取矩阵状态
+    auto gridMatrix = mission.getGridMatrix();
+    ROS_INFO("Grid matrix size: %zux%zu", 
+             gridMatrix.size(), gridMatrix[0].size());
 
     mission_id = MISSION_ID;
     mission.loadMission(mission_id);
@@ -848,4 +891,94 @@ int main(int argc,char** argv)
     FlightCorer.main_loop();
     
     return 0;
+}
+
+GridMap::GridMap() : stateMatrix_(ROWS, std::vector<int>(COLS, 0))
+{
+    
+    for (int i = 0; i < ROWS; ++i) {
+        for (int j = 0; j < COLS; ++j) {
+            stateMatrix_[i][j] = 0; // 0=正常, 1=禁飞, 2=已巡查, 3=有动物
+        }
+    }
+}
+
+void GridMap::setNoFlyFromAB(const std::vector<std::string>& zones)
+{
+    for (const auto& zone : zones)
+    {
+        std::pair<int, int> idx = ab2Grid(zone);
+        int i = idx.first;
+        int j = idx.second;
+        if (i >= 0 && j >= 0)
+        {
+            setBitPosition(i, j, true);
+            stateMatrix_[i][j] = 1; // 标记为禁飞区
+        }
+    }
+}
+
+std::bitset<63> GridMap::getFullBitMap() const
+{ 
+        return bitMap_; 
+}
+
+std::vector<std::vector<int>> GridMap::getStateMatrix() const 
+{
+    return stateMatrix_;
+}
+
+void GridMap::setGridState(int i, int j, int state)
+{
+    if (i >= 0 && i < ROWS && j >= 0 && j < COLS)
+    {
+        stateMatrix_[i][j] = state;
+    }
+}
+
+std::pair<int, int> GridMap::ab2Grid(const std::string& ab)
+{
+    if (ab.length() != 4) return {-1, -1};
+    int col = 8 - (ab[1] - '1'); // A9→0, A8→1, ..., A1→8
+    int row = ab[3] - '1';       // B1→0, B2→1, ..., B7→6
+    return {row, col};
+}
+
+void GridMap::printMap() const
+{
+    std::cout << "Grid Map State:\n";
+    std::cout << "   ";
+    for (int j = 0; j < COLS; ++j)
+    {
+        std::cout << "A" << (9-j) << " ";
+    }
+    std::cout << "\n";
+        
+    for (int i = 0; i < ROWS; ++i)
+    {
+        std::cout << "B" << (i+1) << " ";
+        for (int j = 0; j < COLS; ++j)
+        {
+            char symbol = '.';
+            switch (stateMatrix_[i][j])
+            {
+                case 1: symbol = 'X'; break; // 禁飞
+                case 2: symbol = 'V'; break; // 已巡查
+                case 3: symbol = 'A'; break; // 有动物
+            }
+            std::cout << " " << symbol << " ";
+        }
+        std::cout << "\n";
+    }
+}
+
+int GridMap::calcBitPosition(int i, int j) const
+{
+    return i * COLS + j;
+}
+
+void GridMap::setBitPosition(int i, int j, bool value)
+{
+    int pos = calcBitPosition(i, j);
+    bitMap_.set(pos, value);
 }

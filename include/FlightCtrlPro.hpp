@@ -26,9 +26,38 @@
 #include <flight_ctrl/SetDebugTarget.h>
 #include <flight_ctrl/TriggerShutdown.h>
 #include "pid.hpp"
-
+#include <bitset>
 #include <dynamic_reconfigure/server.h>
 #include <flight_ctrl/PidGainsConfig.h>
+
+class GridMap {
+private:
+    // 核心数据结构
+    const int ROWS = 7; // B1-B7
+    const int COLS = 9; // A1-A9
+    std::bitset<63> bitMap_;     // 全区域位图（0=可飞，1=禁飞）
+    std::vector<std::vector<int>> stateMatrix_; // 网格状态矩阵
+
+
+    // 位图位置计算 (行优先)
+    int calcBitPosition(int i, int j) const;
+    void setBitPosition(int i, int j, bool value);
+    
+public:
+    // 初始化状态矩阵
+    GridMap();
+    
+    // === 位图操作接口 ===
+    void setNoFlyFromAB(const std::vector<std::string>& zones);
+    std::bitset<63> getFullBitMap() const;
+    // === 矩阵操作接口 ===
+    std::vector<std::vector<int>> getStateMatrix() const;
+    void setGridState(int i, int j, int state);
+    // === 坐标转换 ===
+    std::pair<int, int> ab2Grid(const std::string& ab);
+    // === 可视化输出 ===
+    void printMap() const;
+};
 
 /*MissionManager类设计 主要关注任务的切换，扩展*/
 class MissionManager 
@@ -37,6 +66,8 @@ private:
     std::vector<Eigen::Vector4d> waypoints_;
     int current_index;
     int current_mission_id;
+
+    GridMap gridMap_;
 
 public:
     MissionManager(); 
@@ -47,6 +78,17 @@ public:
     void nextWaypoint();
     bool isFinished();
     void reset();
+
+    // 初始化时设置禁飞区
+    void initNoFlyZones(const std::vector<std::string>& zones);
+    // 巡查过程中更新网格状态
+    void markGridCovered(int i, int j);
+    void markAnimalFound(int i, int j);
+    // 获取位图用于路径规划
+    std::bitset<63> getNoFlyBitmap() const;
+    // 获取矩阵状态用于算法
+    std::vector<std::vector<int>> getGridMatrix() const;
+
 };
 
 /* MapMotion类的设计，构造map坐标系,负责处理坐标系转化问题，以及控制量计算*/
