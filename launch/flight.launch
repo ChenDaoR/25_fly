@@ -1,0 +1,6 @@
+<launch>
+
+  <node pkg="flight_ctrl" name="FlightPanel" type="FlightPanel"/>
+  <node pkg="flight_ctrl" name="FlightCtrl" type="FlightCtrl"/>
+
+</launch>
