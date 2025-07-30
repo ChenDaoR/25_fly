@@ -190,23 +190,18 @@ include_directories(
 
 
 
-add_executable(FlightCtrl src/FlightCtrl_node.cpp src/FlightCtrl.cpp src/pid.cpp)
-target_link_libraries(FlightCtrl
+add_executable(flight src/FlightCtrlPro.cpp src/pid.cpp)
+target_link_libraries(flight
   ${catkin_LIBRARIES}
 )
 
-add_executable(fp src/FlightCtrlPro.cpp src/pid.cpp)
-target_link_libraries(fp
+add_executable(panel src/FlightPanel.cpp)
+target_link_libraries(panel
   ${catkin_LIBRARIES}
 )
 
-add_executable(FlightPanel src/FlightPanel.cpp)
-target_link_libraries(FlightPanel
-  ${catkin_LIBRARIES}
-)
-
-add_executable(serial_test src/serial_test.cpp)
-target_link_libraries(serial_test
+add_executable(serial src/serial_test.cpp)
+target_link_libraries(serial
   ${catkin_LIBRARIES}
 )
 
