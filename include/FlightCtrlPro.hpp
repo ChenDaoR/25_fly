@@ -30,6 +30,7 @@
 #include <dynamic_reconfigure/server.h>
 #include <flight_ctrl/PidGainsConfig.h>
 #include <boost/crc.hpp>
+#include <boost/filesystem.hpp>
 
 struct GridWaypoint
 {
@@ -38,7 +39,7 @@ struct GridWaypoint
     int action;                    // 执行动作 (0:仅飞行, 1:巡查, 2:降落)
     
     GridWaypoint() = default;
-    GridWaypoint(int r, int c, double h, int a) 
+    GridWaypoint(int r, int c, double h = 1.2, int a = 0) 
         : grid_coord(r, c), height(h), action(a) {}
     
     // 转换为字符串表示
@@ -107,20 +108,19 @@ struct PrecomputedPath
 class GridMap {
 private:
     // 核心数据结构
-    const int ROWS = 7; // B1-B7
-    const int COLS = 9; // A1-A9
     std::bitset<63> bitMap_;     // 全区域位图（0=可飞，1=禁飞）
     std::vector<std::vector<int>> stateMatrix_; // 网格状态矩阵
-
 
     // 位图位置计算 (行优先)
     int calcBitPosition(int i, int j) const;
     void setBitPosition(int i, int j, bool value);
     
 public:
+
+    const int ROWS = 7; // B1-B7
+    const int COLS = 9; // A1-A9
     // 初始化状态矩阵
     GridMap();
-    
     // === 位图操作接口 ===
     void setNoFlyFromAB(const std::vector<std::string>& zones);
     std::bitset<63> getFullBitMap() const;
@@ -129,9 +129,12 @@ public:
     void setGridState(int i, int j, int state);
     // === 坐标转换 ===
     std::pair<int, int> ab2Grid(const std::string& ab);
+    Eigen::Vector2d grid2Map(int i, int j) const;
     // === 可视化输出 ===
     void printMap() const;
     const std::bitset<63> getBitMap() const { return bitMap_; }
+    bool isNoFlyZone(int i, int j) const;
+    
 };
 
 /*MissionManager类设计 主要关注任务的切换，扩展*/
@@ -140,45 +143,30 @@ class MissionManager
 private:
 
     // 成员变量
-    GridMap grid_map_; // 包含当前位图状态
+    GridMap gridMap_; // 包含当前位图状态
     std::vector<GridWaypoint> current_path_;
     size_t current_waypoint_index_ = 0;
     ros::Time waypoint_start_time_; // 当前航点开始时间
     double max_waypoint_time_ = 5.0; // 最大飞行时间 (秒)
     // 存储路径的文件名
     std::string path_directory_;
-    std::string PATH_FILE;
-
-    std::vector<Eigen::Vector4d> waypoints_;
-    int current_index;
-    int current_mission_id;
-    GridMap gridMap_;
-
-    std::string calculateBitmapHash() const; // 计算当前位图的唯一hash
-    PrecomputedPath findPathByBitmap(const std::string& bitmap_hash) const;
-    bool savePathsToFile(const std::vector<PrecomputedPath>& paths);
-    std::vector<PrecomputedPath> loadPathsFromFile() const;
-    std::string getPathFilename(const std::string& bitmap_hash) const;
-
+    
 public:
     //MissionManager(); 
     explicit MissionManager(const std::string& path_directory = "~/mission_paths");
-    ~MissionManager();
-    bool loadMission(const int& misssion_id);   
-    const Eigen::Vector4d& getCurrentWaypoint();
+    ~MissionManager();  
+    // 重构loadMission：从位图加载预规划路径
+    bool loadMission(const std::string& mission_name, const std::string& bitmap_hash);
+    const Eigen::Vector2d getCurrentWaypoint();
     int getCurrentIndex();
     void nextWaypoint();
     bool isFinished();
     void reset();
 
-     // 重构loadMission：从位图加载预规划路径
-    bool loadMission(const std::string& mission_name, const std::string& bitmap_hash);
     // 获取当前路径
     const std::vector<GridWaypoint>& getCurrentPath() const { return current_path_; }
     // 检查是否已加载路径
     bool isPathLoaded() const { return !current_path_.empty(); }
-    // 超时处理：切换到下一个航点
-    void handleTimeout();
     // 初始化时设置禁飞区
     void initNoFlyZones(const std::vector<std::string>& zones);
     // 巡查过程中更新网格状态
@@ -188,9 +176,12 @@ public:
     std::bitset<63> getNoFlyBitmap() const;
     // 获取矩阵状态用于算法
     std::vector<std::vector<int>> getGridMatrix() const;
-    // 新增路径保存接口
-    bool savePathToFile(const PrecomputedPath& path);
 
+    std::string calculateBitmapHash() const; // 计算当前位图的唯一hash
+    PrecomputedPath findPathByBitmap(const std::string& bitmap_hash) const;
+    std::vector<PrecomputedPath> loadPathsFromFile() const;
+    std::string getPathFilename(const std::string& bitmap_hash) const;
+    PrecomputedPath generateDefaultPath(const std::string& bitmap_hash) const;
 };
 
 /* MapMotion类的设计，构造map坐标系,负责处理坐标系转化问题，以及控制量计算*/
@@ -312,6 +303,9 @@ private:
 
     MapMotion move;
     MissionManager mission;
+    std::vector<std::vector<int>> gridMatrix;
+    std::bitset<63> noFlyBitmap;
+    std::string bitmap_hash;
 
     void state_Callback(const mavros_msgs::State::ConstPtr& msg);   //状态回调
     void reference_position_Callback(const geometry_msgs::PoseStamped::ConstPtr& msg);  //位置反馈回调

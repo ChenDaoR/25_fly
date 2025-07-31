@@ -4,7 +4,7 @@
 #define TAKEOFF_HEIGHT 1
 #define POS_ERR 0.1
 #define YAW_ERR 0.5
-#define TIMEOUT 10
+#define TIMEOUT 5
 #define MISSION_ID 1
 #define USE_VINS 1
 #define VINS_ERR_THE_POS 1
@@ -292,85 +292,59 @@ void MapMotion::dy_pid_Callback(flight_ctrl::PidGainsConfig &config,uint32_t lev
                             config.yaw_d_filter_value);
 }
 
-MissionManager::MissionManager(const std::string& path_directory){}
-
-MissionManager::~MissionManager(){}
-
-bool MissionManager::loadMission(const int& mission_id)
+MissionManager::MissionManager(const std::string& path_directory)
 {
-    std::ifstream file("/home/feng/Myothers/config/missions.json");
-    if (!file.is_open())
+    // 确保目录存在
+    namespace fs = boost::filesystem;
+    fs::path dir_path(path_directory);
+    if (!fs::exists(dir_path)) 
     {
-        ROS_ERROR("[MISSION] Failed to open config/missions.json");
-        return false;
-    }
-
-    nlohmann::json j;
-    try
-    {
-        file >> j;
-    }
-    catch (const std::exception& e)
-    {
-        ROS_ERROR("[MISSION] JSON parse error: %s", e.what());
-        return false;
-    }
-
-    ROS_INFO("[MISSION] Loaded missions.json, found %lu missions", j["missions"].size());
-
-    for (const auto& mission : j["missions"])
-    {
-        if (mission["id"].get<int>() == mission_id)
+        if (!fs::create_directories(dir_path)) 
         {
-            current_mission_id = mission_id;
-            waypoints_.clear();
-            ROS_INFO("[MISSION] Loading mission ID %d with %lu waypoints", 
-                     mission_id, mission["waypoints"].size());
-            for (const auto& wp : mission["waypoints"])
-            {
-                waypoints_.push_back(Eigen::Vector4d(wp[0], wp[1], wp[2], wp[3]));
-                ROS_INFO("[MISSION] Waypoint %lu: [%.2f, %.2f, %.2f, %.2f]", waypoints_.size()-1,  wp[0].get<double>(),  wp[1].get<double>(),  wp[2].get<double>(),  wp[3].get<double>());
-            }
-            current_index = 0;
-            return true;
+            ROS_ERROR("Failed to create mission path directory: %s", path_directory.c_str());
+        } 
+        else 
+        {
+            ROS_INFO("Created mission path directory: %s", path_directory.c_str());
         }
     }
 
-    std::cerr << "Mission with id " << mission_id << " not found" << std::endl;
-    return false;
+    path_directory_ = path_directory;
 }
 
-const Eigen::Vector4d& MissionManager::getCurrentWaypoint()
+MissionManager::~MissionManager(){}
+
+const Eigen::Vector2d MissionManager::getCurrentWaypoint()
 {
-    static Eigen::Vector4d null_waypoint(0.0, 0.0, 0.0, 0.0);
-    if (current_index >= 0 && current_index < waypoints_.size())
+    static Eigen::Vector2d null_waypoint(0.0,0.0);
+    if (current_waypoint_index_ >= 0 && current_waypoint_index_ < current_path_.size())
     {
-        return waypoints_[current_index];
+        return gridMap_.grid2Map(current_path_[current_waypoint_index_].grid_coord(0),current_path_[current_waypoint_index_].grid_coord(1));
     }
     return null_waypoint;
 }
 
 int MissionManager::getCurrentIndex()
 {
-    return current_index;
+    return current_waypoint_index_;
 }
 
 void MissionManager::nextWaypoint()
 {
-    if (current_index < waypoints_.size())
+    if (current_waypoint_index_ < current_path_.size())
     {
-        current_index++;
+        current_waypoint_index_++;
     }
 }
 
 bool MissionManager::isFinished()
 {
-    return current_index >= waypoints_.size();
+    return current_waypoint_index_ >= current_path_.size();
 }
 
 void MissionManager::reset()
 {
-    current_index = 0;
+    current_waypoint_index_ = 0;
 }
 void MissionManager::initNoFlyZones(const std::vector<std::string>& zones)
 {
@@ -391,19 +365,21 @@ void MissionManager::markAnimalFound(int i, int j) {
 }
     
 // 获取位图用于路径规划
-std::bitset<63> MissionManager::getNoFlyBitmap() const {
+std::bitset<63> MissionManager::getNoFlyBitmap() const
+{
     return gridMap_.getFullBitMap();
 }
     
 // 获取矩阵状态用于算法
-std::vector<std::vector<int>> MissionManager::getGridMatrix() const {
+std::vector<std::vector<int>> MissionManager::getGridMatrix() const
+{
     return gridMap_.getStateMatrix();
 }
 
 // 计算位图的唯一哈希值
 std::string MissionManager::calculateBitmapHash() const
 {
-    const auto& bitmap = grid_map_.getBitMap();   // std::bitset<63>
+    const auto& bitmap = gridMap_.getBitMap();   // std::bitset<63>
 
     boost::crc_32_type crc32;
 
@@ -450,95 +426,73 @@ bool MissionManager::loadMission(const std::string& mission_name,
     return true;
 }
 
-// 从文件查找匹配的路径
-PrecomputedPath MissionManager::findPathByBitmap(const std::string& bitmap_hash) const 
-{
-    auto all_paths = loadPathsFromFile();
+// 从文件加载路径 (直接按哈希文件名加载)
+PrecomputedPath MissionManager::findPathByBitmap(const std::string& bitmap_hash) const {
+    std::string filename = getPathFilename(bitmap_hash);
     
-    for (const auto& path : all_paths) 
-    {
-        if (path.bitmap_str == bitmap_hash)
-        {
-            ROS_DEBUG("Found matching path ID: %u", path.id);
-            return path;
-        }
-    }
-    
-    ROS_WARN("No matching path for hash %s, loading default...", bitmap_hash.c_str());
-    // 生成默认路径 (直线巡查)
-    PrecomputedPath default_path;
-    default_path.bitmap_str = bitmap_hash;
-    
-    // 添加降落点
-    //default_path.waypoints.emplace_back(0, 0, 0.5, 2); // 降落动作
-    return default_path;
-}
-
-// 保存路径到文件
-bool MissionManager::savePathsToFile(const std::vector<PrecomputedPath>& paths) 
-{
-    nlohmann::json j_array;
-    
-    for (const auto& path : paths) 
-    {
-        j_array.push_back(path.toJson());
-    }
-    
-    std::ofstream out_file(PATH_FILE);
-    if (!out_file) 
-    {
-        ROS_ERROR("Failed to open path file: %s", PATH_FILE.c_str());
-        return false;
-    }
-    
-    out_file << j_array.dump(4); // 缩进4格增强可读性
-    return true;
-}
-
-// 从文件加载路径
-std::vector<PrecomputedPath> MissionManager::loadPathsFromFile() const {
-    std::vector<PrecomputedPath> paths;
-    
-    std::ifstream in_file(PATH_FILE);
-    if (!in_file) {
-        ROS_WARN("Precomputed path file not found: %s", PATH_FILE.c_str());
-        return paths;
+    // 检查文件是否存在
+    std::ifstream file(filename);
+    if (!file.is_open()) {
+        ROS_WARN("No precomputed path file found: %s", filename.c_str());
+        return generateDefaultPath(bitmap_hash); // 生成默认路径
     }
     
     try {
         nlohmann::json j;
-        in_file >> j;
-        
-        for (const auto& item : j) {
-            paths.push_back(PrecomputedPath::fromJson(item));
-        }
+        file >> j;
+        return PrecomputedPath::fromJson(j);
     } catch (const std::exception& e) {
-        ROS_ERROR("Error parsing path file: %s", e.what());
+        ROS_ERROR("Error parsing path file %s: %s", filename.c_str(), e.what());
+        return generateDefaultPath(bitmap_hash);
     }
-    
-    ROS_INFO("Loaded %zu precomputed paths", paths.size());
-    return paths;
 }
 
-// 超时处理：切换到下一个航点
-void MissionManager::handleTimeout() {
-    if (current_path_.empty()) return;
+// 生成默认路径 (当找不到对应文件时)
+PrecomputedPath MissionManager::generateDefaultPath(const std::string& bitmap_hash) const
+{
+    PrecomputedPath default_path;
+    default_path.bitmap_str = bitmap_hash;
     
-    // 检查是否超时
-    double elapsed = (ros::Time::now() - waypoint_start_time_).toSec();
-    if (elapsed >= max_waypoint_time_) {
-        ROS_WARN("Waypoint %zu timeout (%.1f sec), moving to next point", 
-                 current_waypoint_index_, elapsed);
-        
-        // 移动到下一个航点
-        if (++current_waypoint_index_ >= current_path_.size()) {
-            ROS_INFO("All waypoints completed");
-            current_path_.clear();
-        } else {
-            // 重置航点计时器
-            waypoint_start_time_ = ros::Time::now();
+    // 简单默认路径：蛇形巡查所有非禁飞区
+    for (int row = 0; row < gridMap_.ROWS; row++) 
+    {
+        if (row % 2 == 0) 
+        {
+            // 偶数行从左到右
+            for (int col = 0; col < gridMap_.COLS; col++) 
+            {
+                if (!gridMap_.isNoFlyZone(row, col)) 
+                {
+                    default_path.waypoints.emplace_back(row, col, 1.2, 1);
+                }
+            }
+        } 
+        else 
+        {
+            // 奇数行从右到左
+            for (int col = gridMap_.COLS - 1; col >= 0; col--) 
+            {
+                if (!gridMap_.isNoFlyZone(row, col)) 
+                {
+                    default_path.waypoints.emplace_back(row, col, 1.2, 1);
+                }
+            }
         }
     }
+    
+    ROS_WARN("Generated default path for bitmap: %s", bitmap_hash.c_str());
+    return default_path;
+}
+
+bool GridMap::isNoFlyZone(int i, int j) const
+{
+    if (i >= 0 && i < ROWS && j >= 0 && j < COLS)
+    {
+        // 检查状态矩阵中该位置是否为禁飞区（状态值1）
+        return stateMatrix_[i][j] == 1;
+    }
+    // 如果索引越界，视为禁飞区以确保安全
+    return true;
 }
 
 // 计算文件名
@@ -587,22 +541,22 @@ FlightCore::FlightCore(const ros::NodeHandle& nh_,const ros::NodeHandle& nh_priv
     move.setErr(POS_ERR,YAW_ERR);
 
     // 接收外部输入的禁飞区代码
-    std::vector<std::string> noFlyZones = {"A8B2", "A7B3", "A6B3"};
-    
+    std::vector<std::string> noFlyZones = {"A3B2", "A4B2", "A5B2"};
     // 初始化地图并转换为位图
     mission.initNoFlyZones(noFlyZones);
-    
     // 获取位图用于路径规划
-    auto noFlyBitmap = mission.getNoFlyBitmap();
+    noFlyBitmap = mission.getNoFlyBitmap();
     ROS_INFO("No-fly bitmap: %s", noFlyBitmap.to_string().c_str());
-    
     // 获取矩阵状态
-    auto gridMatrix = mission.getGridMatrix();
+    gridMatrix = mission.getGridMatrix();
     ROS_INFO("Grid matrix size: %zux%zu", 
              gridMatrix.size(), gridMatrix[0].size());
+    // 提前计算位图哈希 (可选)
+    bitmap_hash = mission.calculateBitmapHash();
+    ROS_INFO("Current bitmap hash: %s", bitmap_hash.c_str());
 
+    mission.loadMission("pre",bitmap_hash);
     mission_id = MISSION_ID;
-    mission.loadMission(mission_id);
 
     last_request = ros::Time::now();
 }
@@ -642,50 +596,31 @@ void FlightCore::vins_position_Callback(const nav_msgs::Odometry::ConstPtr& msg)
                              reference_position_cb.pose.position.y,
                              reference_position_cb.pose.position.z);
     Eigen::Vector3d curr_map = move.enu2Map_pos(curr_enu);
-    Eigen::Vector2d ref(
-    curr_map(0),
-    curr_map(1)
-    );
-    Eigen::Vector2d vins(
-        vins_position_cb.pose.pose.position.x,
-        vins_position_cb.pose.pose.position.y
-    );
-    Eigen::Vector2d err = ref - vins;
-    vins_err = err.norm();
 
     ROS_INFO_THROTTLE(0.5,"map_x_pos: %.3f , map_y_pos: %.3f , vins_x_pos: %.3f , vins_y_pos: %.3f",curr_map(0),curr_map(1),vins_position_cb.pose.pose.position.x,vins_position_cb.pose.pose.position.y);
 
 
-    bool pos_ok = std::abs(err(0)) > vins_err_pos_The || std::abs(err(1)) > vins_err_pos_The || vins_err > vins_err_pos_The * 1.4;
+    bool pos_ok = std::abs(vins_position_cb.pose.pose.position.x) > VINS_ERR_THE_POS || std::abs(vins_position_cb.pose.pose.position.y) > VINS_ERR_THE_POS;
 
     curr_enu = Eigen::Vector3d(reference_velocity_cb.twist.linear.x,
                             reference_velocity_cb.twist.linear.y,
                             reference_velocity_cb.twist.linear.z);
     curr_map = move.enu2Map_vel(curr_enu);
-    ref = Eigen::Vector2d(
-        curr_map(0),
-        curr_map(1)
-    );
-    vins = Eigen::Vector2d(
-        vins_position_cb.twist.twist.linear.x,
-        vins_position_cb.twist.twist.linear.y
-    );
-    err = ref - vins;
 
     ROS_INFO_THROTTLE(0.5,"map_x_vel: %.3f , map_y_vel: %.3f , vins_x_vel: %.3f , vins_y_vel: %.3f",curr_map(0),curr_map(1),vins_position_cb.twist.twist.linear.x,vins_position_cb.twist.twist.linear.y);
 
-    bool vel_ok = std::abs(err(0)) > vins_err_vel_The || std::abs(err(1)) > vins_err_vel_The || err.norm() > vins_err_vel_The * 1.4;
+    bool vel_ok = std::abs(vins_position_cb.twist.twist.linear.x) > VINS_ERR_THE_VEL || std::abs(vins_position_cb.twist.twist.linear.y) > VINS_ERR_THE_VEL;
 
-    // if(use_vins && (pos_ok||vel_ok))
-    // {
-    //     emergency_pos = reference_position_cb;
-    //     vins_drifted = true;
-    //     ROS_INFO("vins drifted...change to land");
+    if(use_vins && (pos_ok||vel_ok))
+    {
+        emergency_pos = reference_position_cb;
+        vins_drifted = true;
+        ROS_INFO("vins drifted...change to land");
 
-    //     FT = Land;
-    //     is_changed = true;
-    //     cache_pos = getNowPose();
-    // }
+        FT = Land;
+        is_changed = true;
+        cache_pos = getNowPose();
+    }
 
 } 
 
@@ -888,19 +823,8 @@ void FlightCore::statusloop_Callback()
         last_request = ros::Time::now();
     }
 
-    // 当前 ENU 坐标
-    Eigen::Vector3d curr_enu(reference_position_cb.pose.position.x,
-                             reference_position_cb.pose.position.y,
-                             reference_position_cb.pose.position.z);
-    // 转到 Map 坐标系
-    Eigen::Vector3d curr_map = move.enu2Map_pos(curr_enu);
-    double curr_yaw_enu = tf2::getYaw(reference_position_cb.pose.orientation);
-    double curr_yaw_map = move.enu2Map_yaw(curr_yaw_enu);
 
-    // ROS_INFO_THROTTLE(0.1,
-    //     "[STATUS] Map Pose: x=%.3f  y=%.3f  err=%.2f ",
-    //     vins_position_cb.pose.pose.position.x,vins_position_cb.pose.pose.position.y,vins_err);
-}
+    }
 
 void FlightCore::cmd_Task_Standby()
 {
@@ -967,9 +891,9 @@ void FlightCore::cmd_Task_Mission()
 
     if(mission.getCurrentIndex() != last_index)
     {
-        Eigen::Vector4d tar = mission.getCurrentWaypoint();
-        Eigen::Vector3d target_pos(tar(0),tar(1),tar(2));
-        double target_yaw = tar(3);
+        Eigen::Vector2d tar = mission.getCurrentWaypoint();
+        Eigen::Vector3d target_pos(tar(0),tar(1),TAKEOFF_HEIGHT);
+        double target_yaw = 0;
         move.setTarget(target_pos,target_yaw);
         ROS_INFO("[MISSION] Setting new target: map_pos[%.2f, %.2f, %.2f], yaw %.2f ", 
                  target_pos(0), target_pos(1), target_pos(2), target_yaw);
@@ -986,10 +910,7 @@ void FlightCore::cmd_Task_Mission()
     {
         if(move.isTimeout(ros::Time::now()))
         {
-            ROS_WARN("[MISSION] Timeout at waypoint %d, switching to Standby", mission.getCurrentIndex());
-            // FT = Standby;
-            // cache_pos = getNowPose();
-            // is_changed = true;
+            ROS_INFO("[MISSION] Timeout at waypoint %d, switching to next point", mission.getCurrentIndex());
             mission.nextWaypoint();
         }
     }
@@ -998,7 +919,7 @@ void FlightCore::cmd_Task_Mission()
 
     if(!mission.isFinished())
     {
-        Eigen::Vector4d current_wp = mission.getCurrentWaypoint();
+        Eigen::Vector2d current_wp = mission.getCurrentWaypoint();
         ROS_INFO_THROTTLE(1.0,"[MISSION] Current waypoint index: %d, target: [%.2f, %.2f, %.2f, %.2f ]", 
              mission.getCurrentIndex(), current_wp(0), current_wp(1), current_wp(2), current_wp(3));
     }
@@ -1080,11 +1001,16 @@ void GridMap::setGridState(int i, int j, int state)
     if (i >= 0 && i < ROWS && j >= 0 && j < COLS)
     {
         stateMatrix_[i][j] = state;
+        
+        // 仅当状态变为1（禁飞）或从1变为其他状态时才更新位图
+        bool isNoFly = (state == 1);
+        bool wasNoFly = (stateMatrix_[i][j] == 1); // 先保存之前的状态
+        
+        if (isNoFly != wasNoFly)
+        {
+            setBitPosition(i, j, isNoFly);
+        }
     }
-
-    // 状态变更时同步位图
-    if (state == 1) setBitPosition(i, j, true);
-    else setBitPosition(i, j, false);
 }
 
 std::pair<int, int> GridMap::ab2Grid(const std::string& ab)
@@ -1132,4 +1058,11 @@ void GridMap::setBitPosition(int i, int j, bool value)
 {
     int pos = calcBitPosition(i, j);
     bitMap_.set(pos, value);
+}
+
+Eigen::Vector2d GridMap::grid2Map(int i, int j) const
+{
+    double x = (i - 4) * 0.5; // 1网格=50cm=0.5m，中心偏移
+    double y = (j - 3) * 0.5; 
+    return Eigen::Vector2d(x, y); 
 }
